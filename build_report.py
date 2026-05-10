@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 生成《公立医院动态能力发展报告》Word文档
+- 中文正文：仿宋；标题：黑体
+- 表格数字：Times New Roman；表格中文：仿宋
+- 表格采用三线表样式
 """
+import re
+
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -10,9 +15,13 @@ from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
 
-# ---------- 样式辅助 ----------
+# ---------- 字体与样式辅助 ----------
+
+NUMERIC_CHARS = set(u'0123456789.±-<>≤≥%/,:()~\u00B1 \t')
+
 
 def set_cn_font(run, name=u'仿宋', size=12, bold=False, color=None):
+    """设置纯中文/正文 run 的字体。"""
     run.font.name = name
     run.font.size = Pt(size)
     run.font.bold = bold
@@ -26,6 +35,53 @@ def set_cn_font(run, name=u'仿宋', size=12, bold=False, color=None):
     rFonts.set(qn('w:eastAsia'), name)
     rFonts.set(qn('w:ascii'), name)
     rFonts.set(qn('w:hAnsi'), name)
+
+
+def _set_run_font(run, cn_name, en_name, size, bold):
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    rPr = run._element.get_or_add_rPr()
+    rFonts = rPr.find(qn('w:rFonts'))
+    if rFonts is None:
+        rFonts = OxmlElement('w:rFonts')
+        rPr.append(rFonts)
+    rFonts.set(qn('w:eastAsia'), cn_name)
+    rFonts.set(qn('w:ascii'), en_name)
+    rFonts.set(qn('w:hAnsi'), en_name)
+    rFonts.set(qn('w:cs'), en_name)
+    run.font.name = en_name
+
+
+def add_mixed_run(paragraph, text, cn_font=u'仿宋', en_font='Times New Roman',
+                  size=10.5, bold=False):
+    """按字符类型切分文本：数字/ASCII 用 Times New Roman，中文用仿宋。"""
+    text = u'' if text is None else str(text)
+    if not text:
+        return
+
+    segments = []
+    cur = ''
+    cur_is_num = None
+    for ch in text:
+        is_num = ch in NUMERIC_CHARS
+        if cur_is_num is None:
+            cur_is_num = is_num
+            cur = ch
+        elif is_num == cur_is_num:
+            cur += ch
+        else:
+            segments.append((cur_is_num, cur))
+            cur_is_num = is_num
+            cur = ch
+    if cur:
+        segments.append((cur_is_num, cur))
+
+    for is_num, seg in segments:
+        run = paragraph.add_run(seg)
+        if is_num:
+            _set_run_font(run, cn_font, en_font, size, bold)
+        else:
+            _set_run_font(run, cn_font, cn_font, size, bold)
 
 
 def add_heading(doc, text, level=1):
@@ -65,27 +121,69 @@ def add_table_caption(doc, text):
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p.paragraph_format.space_before = Pt(6)
     p.paragraph_format.space_after = Pt(3)
-    run = p.add_run(text)
-    set_cn_font(run, name=u'黑体', size=11, bold=True)
+    # 表号部分使用 Times New Roman，其余中文使用黑体
+    add_mixed_run(p, text, cn_font=u'黑体', en_font='Times New Roman',
+                  size=11, bold=True)
 
 
-def set_cell_borders(cell):
+# ---------- 三线表样式 ----------
+
+def _set_cell_borders_three_line(cell, row_position, is_header_row=False):
+    """
+    row_position: 'header' | 'middle' | 'last'
+    三线表：首行上边框粗；首行下边框细；末行下边框粗；其余无横线；无竖线。
+    """
     tc = cell._tc
     tcPr = tc.get_or_add_tcPr()
+    existing = tcPr.find(qn('w:tcBorders'))
+    if existing is not None:
+        tcPr.remove(existing)
     tcBorders = OxmlElement('w:tcBorders')
-    for edge in ('top', 'left', 'bottom', 'right'):
-        border = OxmlElement(f'w:{edge}')
-        border.set(qn('w:val'), 'single')
-        border.set(qn('w:sz'), '6')
-        border.set(qn('w:color'), '000000')
-        tcBorders.append(border)
+
+    def _border(edge, val, sz='0'):
+        b = OxmlElement(f'w:{edge}')
+        b.set(qn('w:val'), val)
+        if val != 'nil':
+            b.set(qn('w:sz'), sz)
+            b.set(qn('w:color'), '000000')
+        return b
+
+    # 左右边框都无
+    tcBorders.append(_border('left', 'nil'))
+    tcBorders.append(_border('right', 'nil'))
+
+    if row_position == 'header':
+        tcBorders.append(_border('top', 'single', '18'))   # 顶部粗线
+        tcBorders.append(_border('bottom', 'single', '6')) # 表头下细线
+    elif row_position == 'last':
+        tcBorders.append(_border('top', 'nil'))
+        tcBorders.append(_border('bottom', 'single', '18'))
+    else:
+        tcBorders.append(_border('top', 'nil'))
+        tcBorders.append(_border('bottom', 'nil'))
+
     tcPr.append(tcBorders)
 
 
-def add_table(doc, headers, rows, col_widths=None):
+def _set_cell_cnf(cell, fill=None):
+    """可选：为表头或斑马行设置底色。"""
+    if fill is None:
+        return
+    tcPr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement('w:shd')
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill)
+    tcPr.append(shd)
+
+
+def add_table(doc, headers, rows, col_widths=None, cell_size=10.5):
+    """创建三线表。数字自动以 Times New Roman 渲染，中文用仿宋。"""
     tbl = doc.add_table(rows=1 + len(rows), cols=len(headers))
     tbl.alignment = WD_TABLE_ALIGNMENT.CENTER
     tbl.autofit = False
+
+    n_rows = 1 + len(rows)
 
     # 表头
     hdr_cells = tbl.rows[0].cells
@@ -94,30 +192,29 @@ def add_table(doc, headers, rows, col_widths=None):
         cell.text = ''
         p = cell.paragraphs[0]
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = p.add_run(h)
-        set_cn_font(run, name=u'黑体', size=10.5, bold=True)
+        p.paragraph_format.space_before = Pt(2)
+        p.paragraph_format.space_after = Pt(2)
+        # 表头：黑体/TNR，加粗
+        add_mixed_run(p, h, cn_font=u'黑体', en_font='Times New Roman',
+                      size=cell_size, bold=True)
         cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        # 表头底色
-        tcPr = cell._tc.get_or_add_tcPr()
-        shd = OxmlElement('w:shd')
-        shd.set(qn('w:val'), 'clear')
-        shd.set(qn('w:color'), 'auto')
-        shd.set(qn('w:fill'), 'DCE6F1')
-        tcPr.append(shd)
-        set_cell_borders(cell)
+        _set_cell_borders_three_line(cell, 'header', is_header_row=True)
 
-    # 数据
+    # 数据行
     for r, row in enumerate(rows, start=1):
         row_cells = tbl.rows[r].cells
+        position = 'last' if r == n_rows - 1 else 'middle'
         for i, val in enumerate(row):
             cell = row_cells[i]
             cell.text = ''
             p = cell.paragraphs[0]
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run(str(val))
-            set_cn_font(run, name=u'仿宋', size=10.5)
+            p.paragraph_format.space_before = Pt(1)
+            p.paragraph_format.space_after = Pt(1)
+            add_mixed_run(p, str(val), cn_font=u'仿宋',
+                          en_font='Times New Roman', size=cell_size)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            set_cell_borders(cell)
+            _set_cell_borders_three_line(cell, position)
 
     # 列宽
     if col_widths is not None:
@@ -164,13 +261,14 @@ set_cn_font(run, name=u'楷体', size=14, bold=False)
 
 
 # =================== 结果总结 ===================
-add_heading(doc, u'结果总结', level=2)
+add_heading(doc, u'公立医院动态能力评估报告', level=2)
 
 add_para(doc,
     u'本报告基于本院面向一线及管理岗位人员开展的动态能力问卷调查，'
-    u'围绕感知识别、学习吸收、协调整合、创新应用四个维度，分别从科室、职务、职业类型、'
-    u'职称、本院工作年限、主要工作内容等人群特征出发，刻画全院动态能力的水平与结构；'
-    u'在此基础上，进一步考察七类组织内部条件对动态能力的作用，以及动态能力对六项医院绩效指标的影响，'
+    u'围绕感知识别、学习吸收、协调整合、创新应用四个维度，'
+    u'分别从科室、职务、职业类型、职称、本院工作年限、主要工作内容等人群特征出发，'
+    u'刻画全院动态能力的水平与结构；在此基础上，进一步考察七类组织内部条件对动态能力的作用，'
+    u'以及动态能力对六项医院绩效指标的影响，'
     u'并将该院与同期调研的其他12家上海市公立医院进行横向对比。主要结论如下：')
 
 add_para(doc,
@@ -204,27 +302,29 @@ add_para(doc,
     u'其他分组比较多数未达到统计学显著水平。')
 
 add_para(doc,
-    u'第四，在综合控制个体和岗位背景变量后，七类组织内部条件中，员工因素'
-    u'（管理者能力、医务人员业务水平、管理与临床协同）是唯一对创新应用能力呈显著正向影响的因素'
+    u'第四，在综合控制个体和岗位背景变量后，七类组织内部条件中，'
+    u'员工因素（管理者能力、医务人员业务水平、管理与临床协同）是唯一对创新应用能力呈显著正向影响的因素'
     u'（β=0.683，P=0.021）。医院文化和员工因素对动态能力总分、学习吸收能力呈正向趋势，'
     u'但均未达到统计学显著水平。')
 
 add_para(doc,
     u'第五，动态能力总分及四个维度与服务量、医疗质量、运营效率、患者满意度、员工满意度、'
-    u'服务公平可及性六项绩效指标均呈显著正向关联，其中协调整合能力与创新应用能力'
-    u'在多数绩效指标上的回归系数相对较高。')
+    u'服务公平可及性六项绩效指标均呈显著正向关联，'
+    u'其中协调整合能力与创新应用能力在多数绩效指标上的回归系数相对较高。')
 
 add_para(doc,
     u'综合以上结果，后续动态能力建设可重点关注创新应用能力、感知识别能力和协调整合能力三个维度，'
     u'并结合员工因素的支持作用，围绕管理者能力建设、医务人员业务水平提升和管理与临床协同开展工作。')
 
 
-# =================== 一、研究背景与分析框架 ===================
-add_heading(doc, u'一、研究背景与分析框架', level=2)
+# =================== 一、分析背景与框架 ===================
+add_heading(doc, u'一、分析背景与框架', level=2)
 
 add_para(doc,
-    u'动态能力指医院在外部环境变化条件下，整合、构建和重新配置内外部资源，以识别机会、'
-    u'应对挑战、实现持续发展的综合能力。本研究将其分为四个维度：'
+    u'动态能力是指医院为能够及时感知内外环境变化带来的挑战和机遇，'
+    u'快速获取、吸收与环境匹配的信息和知识，进而对医院现有资源进行重新配置组合，'
+    u'以形成能够回应公众健康需求、适应新的行业生态和促进医院韧性发展的持续性能力。'
+    u'本研究将其分为四个维度：'
     u'感知识别能力（对政策变化、服务需求变化、新技术新方法等变化信息的识别与捕捉）、'
     u'学习吸收能力（对外部知识、经验与信息的获取、理解和内部转化）、'
     u'协调整合能力（资源协调、人员协同和流程整合）、'
@@ -234,8 +334,7 @@ add_para(doc,
     u'本报告基于院内问卷数据，依次从科室、职务、职业类型、职称、本院工作年限、'
     u'主要工作内容六个维度进行分组比较；在此基础上，分析医院文化、医院资源、医院战略、'
     u'路径依赖、环境因素、员工因素和管理特征七类影响因素与动态能力的关系，'
-    u'以及动态能力对六项医院绩效指标的影响。此外，将本院得分与同期调研的其他12家上海市公立医院'
-    u'平均水平进行横向对比，结果已在前文"结果总结"中一并呈现。')
+    u'以及动态能力对六项医院绩效指标的影响。')
 
 
 # =================== 二、不同科室动态能力情况 ===================
@@ -258,7 +357,7 @@ add_para(doc,
     u'中医科、门诊、医技科室得分相对较高，行政管理办公室和内科系病房接近均值，外科系略低于均值，'
     u'急诊相关科室、儿科和预防保健科得分相对较低。事后比较显示，门诊和中医科均显著高于急诊相关科室和儿科。')
 
-add_table_caption(doc, u'表1  动态能力总分分科室结果')
+add_table_caption(doc, u'表2  动态能力总分分科室结果')
 add_table(doc,
     [u'科室', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -273,7 +372,7 @@ add_table(doc,
         [u'儿科', 2, u'2.594±0.840', 9],
     ])
 
-add_table_caption(doc, u'表1-附  动态能力总分主要显著差异')
+add_table_caption(doc, u'表2-附  动态能力总分主要显著差异')
 add_table(doc,
     [u'比较科室', u'差异方向', u'P值'],
     [
@@ -291,7 +390,7 @@ add_para(doc,
     u'事后比较显示，儿科显著低于行政管理办公室、门诊、医技科室和中医科；'
     u'门诊、中医科也显著高于急诊相关科室。')
 
-add_table_caption(doc, u'表2  感知识别能力分科室结果')
+add_table_caption(doc, u'表3  感知识别能力分科室结果')
 add_table(doc,
     [u'科室', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -306,7 +405,7 @@ add_table(doc,
         [u'儿科', 2, u'2.438±0.619', 9],
     ])
 
-add_table_caption(doc, u'表2-附  感知识别能力主要显著差异')
+add_table_caption(doc, u'表3-附  感知识别能力主要显著差异')
 add_table(doc,
     [u'比较科室', u'差异方向', u'P值'],
     [
@@ -325,7 +424,7 @@ add_para(doc,
     u'外科系略低于均值；急诊相关科室、儿科和预防保健科得分相对较低。'
     u'事后比较显示，门诊和中医科均显著高于急诊相关科室和儿科。')
 
-add_table_caption(doc, u'表3  学习吸收能力分科室结果')
+add_table_caption(doc, u'表4  学习吸收能力分科室结果')
 add_table(doc,
     [u'科室', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -340,7 +439,7 @@ add_table(doc,
         [u'儿科', 2, u'2.500±0.707', 9],
     ])
 
-add_table_caption(doc, u'表3-附  学习吸收能力主要显著差异')
+add_table_caption(doc, u'表4-附  学习吸收能力主要显著差异')
 add_table(doc,
     [u'比较科室', u'差异方向', u'P值'],
     [
@@ -356,7 +455,7 @@ add_para(doc,
     u'经Bonferroni校正后两两比较未达到统计学显著水平。中医科、门诊、医技科室得分较高，'
     u'内科系病房和行政管理办公室接近均值，外科系略低，急诊相关科室、儿科和预防保健科得分相对较低。')
 
-add_table_caption(doc, u'表4  协调整合能力分科室结果')
+add_table_caption(doc, u'表5  协调整合能力分科室结果')
 add_table(doc,
     [u'科室', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -379,7 +478,7 @@ add_para(doc,
     u'外科系、急诊相关科室、儿科和预防保健科得分较低。事后比较显示，中医科显著高于儿科；'
     u'门诊与儿科、中医科与急诊相关科室的差异接近显著。')
 
-add_table_caption(doc, u'表5  创新应用能力分科室结果')
+add_table_caption(doc, u'表6  创新应用能力分科室结果')
 add_table(doc,
     [u'科室', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -394,7 +493,7 @@ add_table(doc,
         [u'儿科', 2, u'2.563±0.795', 9],
     ])
 
-add_table_caption(doc, u'表5-附  创新应用能力主要显著差异')
+add_table_caption(doc, u'表6-附  创新应用能力主要显著差异')
 add_table(doc,
     [u'比较科室', u'差异方向', u'P值'],
     [
@@ -410,16 +509,11 @@ add_para(doc,
     u'从均值看，科室工作人员在总分及四个维度上均居首位，职能部门工作人员和职能部门负责人多接近全院均值，'
     u'科室负责人整体略低于全院均值。院级领导样本量仅1人，结果仅作描述性参考。')
 
-def add_role_tables(doc, tables):
-    for caption, rows in tables:
-        add_table_caption(doc, caption)
-        add_table(doc, [u'职务类型', u'样本量', u'均值±标准差', u'排序'], rows)
-
 add_heading(doc, u'（一）动态能力总分', level=3)
 add_para(doc,
     u'总体差异未达到统计学显著水平（F=1.06，P=0.3836；Kruskal-Wallis P=0.3437）。'
     u'得分由高到低依次为科室工作人员、职能部门工作人员、职能部门负责人、科室负责人、院级领导。')
-add_table_caption(doc, u'表6  动态能力总分分职务结果')
+add_table_caption(doc, u'表7  动态能力总分分职务结果')
 add_table(doc,
     [u'职务类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -435,7 +529,7 @@ add_para(doc,
     u'总体差异未达到统计学显著水平（F=1.55，P=0.1996；Kruskal-Wallis P=0.1491）。'
     u'科室工作人员、职能部门负责人和职能部门工作人员得分均高于全院均值，'
     u'科室负责人和院级领导相对较低。')
-add_table_caption(doc, u'表7  感知识别能力分职务结果')
+add_table_caption(doc, u'表8  感知识别能力分职务结果')
 add_table(doc,
     [u'职务类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -451,7 +545,7 @@ add_para(doc,
     u'总体差异未达到统计学显著水平（F=1.10，P=0.3636；Kruskal-Wallis P=0.3146）。'
     u'科室工作人员得分最高，职能部门工作人员和院级领导接近均值，'
     u'职能部门负责人和科室负责人相对较低。')
-add_table_caption(doc, u'表8  学习吸收能力分职务结果')
+add_table_caption(doc, u'表9  学习吸收能力分职务结果')
 add_table(doc,
     [u'职务类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -467,7 +561,7 @@ add_para(doc,
     u'总体差异未达到统计学显著水平（F=0.78，P=0.5435；Kruskal-Wallis P=0.3964）。'
     u'科室工作人员和职能部门工作人员得分相对较高，院级领导和科室负责人接近均值，'
     u'职能部门负责人相对较低。')
-add_table_caption(doc, u'表9  协调整合能力分职务结果')
+add_table_caption(doc, u'表10  协调整合能力分职务结果')
 add_table(doc,
     [u'职务类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -483,7 +577,7 @@ add_para(doc,
     u'总体差异未达到统计学显著水平（F=0.96，P=0.4375；Kruskal-Wallis P=0.3427）。'
     u'科室工作人员得分最高，职能部门工作人员高于均值，'
     u'科室负责人、职能部门负责人和院级领导相对较低。')
-add_table_caption(doc, u'表10  创新应用能力分职务结果')
+add_table_caption(doc, u'表11  创新应用能力分职务结果')
 add_table(doc,
     [u'职务类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -512,7 +606,7 @@ add_para(doc,
     u'方差分析接近统计学显著（F=2.44，P=0.0570），Kruskal-Wallis检验显示差异具有统计学意义（P=0.0425）。'
     u'经Bonferroni校正后，具体两两比较未达到统计学显著水平。医技人员得分最高，'
     u'护士高于均值，后勤和管理人员接近或略低于均值，医生相对较低。')
-add_table_caption(doc, u'表11  动态能力总分分职业类型结果')
+add_table_caption(doc, u'表12  动态能力总分分职业类型结果')
 add_table(doc,
     [u'职业类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -528,7 +622,7 @@ add_para(doc,
     u'感知识别能力五类职业类型人员均值为3.965分，职业类型间差异具有统计学意义'
     u'（F=2.69，P=0.0399；Kruskal-Wallis P=0.0388）。经Bonferroni校正后，两两比较未达到统计学显著水平。'
     u'医技人员得分最高，护士和后勤人员高于均值，管理人员接近均值，医生相对较低。')
-add_table_caption(doc, u'表12  感知识别能力分职业类型结果')
+add_table_caption(doc, u'表13  感知识别能力分职业类型结果')
 add_table(doc,
     [u'职业类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -544,7 +638,7 @@ add_para(doc,
     u'学习吸收能力五类职业类型人员均值为3.881分，职业类型间差异未达到统计学显著水平'
     u'（F=1.96，P=0.1118；Kruskal-Wallis P=0.1322）。医技人员和护士得分较高，管理和后勤人员接近均值，'
     u'医生相对较低。')
-add_table_caption(doc, u'表13  学习吸收能力分职业类型结果')
+add_table_caption(doc, u'表14  学习吸收能力分职业类型结果')
 add_table(doc,
     [u'职业类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -560,7 +654,7 @@ add_para(doc,
     u'协调整合能力五类职业类型人员均值为3.936分，职业类型间差异具有统计学意义'
     u'（F=2.55，P=0.0486；Kruskal-Wallis P=0.0322）。经Bonferroni校正后，两两比较未达到统计学显著水平。'
     u'医技人员得分最高，护士高于均值，后勤、医生和管理人员得分相对较低且较为接近。')
-add_table_caption(doc, u'表14  协调整合能力分职业类型结果')
+add_table_caption(doc, u'表15  协调整合能力分职业类型结果')
 add_table(doc,
     [u'职业类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -577,7 +671,7 @@ add_para(doc,
     u'职业类型间差异未达到统计学显著水平，但呈现一定差异趋势'
     u'（F=2.27，P=0.0726；Kruskal-Wallis P=0.0723）。'
     u'医技人员得分最高，护士高于均值，后勤人员接近均值，医生和管理人员相对较低。')
-add_table_caption(doc, u'表15  创新应用能力分职业类型结果')
+add_table_caption(doc, u'表16  创新应用能力分职业类型结果')
 add_table(doc,
     [u'职业类型', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -602,7 +696,7 @@ add_para(doc,
     u'全院动态能力总分均值3.918分，职称间差异未达到统计学显著水平'
     u'（F=1.97，P=0.1113；Kruskal-Wallis P=0.0607）。初级职称人员得分最高，'
     u'无职称和中级人员接近或高于均值，副高级和正高级人员相对较低。')
-add_table_caption(doc, u'表16  动态能力总分分职称结果')
+add_table_caption(doc, u'表17  动态能力总分分职称结果')
 add_table(doc,
     [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -618,7 +712,7 @@ add_para(doc,
     u'全院均值3.981分，职称间差异未达到统计学显著水平'
     u'（F=2.14，P=0.0874；Kruskal-Wallis P=0.0500）。'
     u'初级职称人员得分最高，中级和无职称人员接近均值，副高级和正高级人员相对较低。')
-add_table_caption(doc, u'表17  感知识别能力分职称结果')
+add_table_caption(doc, u'表18  感知识别能力分职称结果')
 add_table(doc,
     [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -634,7 +728,7 @@ add_para(doc,
     u'全院均值3.898分，职称间差异未达到统计学显著水平'
     u'（F=2.16，P=0.0845；Kruskal-Wallis P=0.0796）。'
     u'初级和无职称人员得分最高，中级人员接近均值，副高级和正高级人员相对较低。')
-add_table_caption(doc, u'表18  学习吸收能力分职称结果')
+add_table_caption(doc, u'表19  学习吸收能力分职称结果')
 add_table(doc,
     [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -650,7 +744,7 @@ add_para(doc,
     u'全院均值3.952分，职称间差异未达到统计学显著水平'
     u'（F=1.81，P=0.1388；Kruskal-Wallis P=0.0996）。'
     u'初级人员得分最高，无职称和中级人员高于均值，副高级和正高级人员相对较低。')
-add_table_caption(doc, u'表19  协调整合能力分职称结果')
+add_table_caption(doc, u'表20  协调整合能力分职称结果')
 add_table(doc,
     [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -666,7 +760,7 @@ add_para(doc,
     u'全院均值3.842分，是四个维度中得分相对较低的维度。职称间差异未达到统计学显著水平'
     u'（F=1.41，P=0.2412；Kruskal-Wallis P=0.1197）。初级人员得分最高，'
     u'无职称和中级人员接近或略高于均值，副高级和正高级人员相对较低。')
-add_table_caption(doc, u'表20  创新应用能力分职称结果')
+add_table_caption(doc, u'表21  创新应用能力分职称结果')
 add_table(doc,
     [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
@@ -687,16 +781,17 @@ add_para(doc,
     u'3年以下组和6–10年组围绕均值分布，20年以上组在多项指标上相对较低。'
     u'20年以上组样本量仅2人，相关结果适合作为参考。')
 
-def add_tenure_section(title_text, head_text, table_caption, rows):
-    add_heading(doc, title_text, level=3)
-    add_para(doc, head_text)
-    add_table_caption(doc, table_caption)
-    add_table(doc, [u'类别', u'样本量', u'均值±标准差', u'排序'], rows)
 
-add_tenure_section(
-    u'（一）动态能力总分',
-    u'总体差异未达到统计学显著水平（F=1.14，P=0.3485；Kruskal-Wallis P=0.2963）。',
-    u'表21  动态能力总分分工作年限结果',
+add_heading(doc, u'（一）动态能力总分', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=1.14，P=0.3485；Kruskal-Wallis P=0.2963）。'
+    u'从均值看，3–5年组得分相对最高（4.213），11–20年组（3.966）与3年以下组（3.935）接近全院均值，'
+    u'6–10年组（3.827）略低于均值，20年以上组得分最低（2.809），'
+    u'整体呈现"工作初期逐步提升—中期稳定—长期略有回落"的描述性趋势，'
+    u'考虑到20年以上组样本量较小，上述趋势仅供参考。')
+add_table_caption(doc, u'表22  动态能力总分分工作年限结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'3-5年', 4, u'4.213±0.905', 1],
         [u'11-20年', 44, u'3.966±0.860', 2],
@@ -705,10 +800,15 @@ add_tenure_section(
         [u'20年以上', 2, u'2.809±0.270', 5],
     ])
 
-add_tenure_section(
-    u'（二）感知识别能力',
-    u'总体差异未达到统计学显著水平（F=1.52，P=0.2076；Kruskal-Wallis P=0.2528）。',
-    u'表22  感知识别能力分工作年限结果',
+add_heading(doc, u'（二）感知识别能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=1.52，P=0.2076；Kruskal-Wallis P=0.2528）。'
+    u'3–5年组得分最高（4.250），11–20年组（4.028）、3年以下组（3.958）和6–10年组（3.927）均接近全院均值，'
+    u'20年以上组得分最低（2.750）。反映出本院工作年限较短的人员在政策变化、'
+    u'服务需求变化和新技术新方法等外部信息识别上处于相对活跃状态。')
+add_table_caption(doc, u'表23  感知识别能力分工作年限结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'3-5年', 4, u'4.250±0.872', 1],
         [u'11-20年', 44, u'4.028±0.804', 2],
@@ -717,11 +817,14 @@ add_tenure_section(
         [u'20年以上', 2, u'2.750±0.354', 5],
     ])
 
-add_tenure_section(
-    u'（三）学习吸收能力',
+add_heading(doc, u'（三）学习吸收能力', level=3)
+add_para(doc,
     u'总体差异未达到统计学显著水平（F=1.00，P=0.4133；Kruskal-Wallis P=0.3404）。'
-    u'3年以下和3–5年组得分较高，11–20年组接近均值，6–10年组略低，20年以上组相对较低。',
-    u'表23  学习吸收能力分工作年限结果',
+    u'3年以下组（4.200）和3–5年组（4.100）得分较高，11–20年组（3.955）接近均值，'
+    u'6–10年组（3.733）略低，20年以上组得分最低（2.800），整体呈现随工作年限延长而略有下降的描述性趋势。')
+add_table_caption(doc, u'表24  学习吸收能力分工作年限结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'3年以下', 3, u'4.200±0.721', 1],
         [u'3-5年', 4, u'4.100±1.052', 2],
@@ -730,10 +833,15 @@ add_tenure_section(
         [u'20年以上', 2, u'2.800±0.283', 5],
     ])
 
-add_tenure_section(
-    u'（四）协调整合能力',
-    u'总体差异未达到统计学显著水平（F=1.42，P=0.2399；Kruskal-Wallis P=0.2130）。',
-    u'表24  协调整合能力分工作年限结果',
+add_heading(doc, u'（四）协调整合能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=1.42，P=0.2399；Kruskal-Wallis P=0.2130）。'
+    u'3–5年组得分最高（4.250），11–20年组（4.006）接近全院均值，'
+    u'3年以下组（3.917）和6–10年组（3.875）略低于均值，20年以上组得分最低（2.688）。'
+    u'提示在跨部门协同和资源整合方面，工作初期到中期人员的自评得分相对更高。')
+add_table_caption(doc, u'表25  协调整合能力分工作年限结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'3-5年', 4, u'4.250±0.957', 1],
         [u'11-20年', 44, u'4.006±0.853', 2],
@@ -742,10 +850,15 @@ add_tenure_section(
         [u'20年以上', 2, u'2.688±0.442', 5],
     ])
 
-add_tenure_section(
-    u'（五）创新应用能力',
-    u'总体差异未达到统计学显著水平（F=0.71，P=0.5909；Kruskal-Wallis P=0.4344）。',
-    u'表25  创新应用能力分工作年限结果',
+add_heading(doc, u'（五）创新应用能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=0.71，P=0.5909；Kruskal-Wallis P=0.4344）。'
+    u'3–5年组得分最高（4.250），11–20年组（3.875）和6–10年组（3.771）接近全院均值，'
+    u'3年以下组（3.667）略低，20年以上组得分最低（3.000）。'
+    u'反映出创新应用能力在本院相对年轻的员工中评价略高。')
+add_table_caption(doc, u'表26  创新应用能力分工作年限结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'3-5年', 4, u'4.250±0.957', 1],
         [u'11-20年', 44, u'3.875±0.953', 2],
@@ -763,56 +876,69 @@ add_para(doc,
     u'未观察到科研类别样本，教学结果仅作描述性参考。从均值看，管理与医疗人员在动态能力总分及四个维度上'
     u'得分较为接近，均接近全院均值，差异均未达到统计学显著水平。')
 
-def add_content_section(title_text, head_text, table_caption, rows):
-    add_heading(doc, title_text, level=3)
-    add_para(doc, head_text)
-    add_table_caption(doc, table_caption)
-    add_table(doc, [u'类别', u'样本量', u'均值±标准差', u'排序'], rows)
-
-add_content_section(
-    u'（一）动态能力总分',
-    u'总体差异未达到统计学显著水平（F=0.93，P=0.3985；Kruskal-Wallis P=0.3214）。',
-    u'表26  动态能力总分分主要工作内容结果',
+add_heading(doc, u'（一）动态能力总分', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=0.93，P=0.3985；Kruskal-Wallis P=0.3214）。'
+    u'从均值看，管理人员（3.944）略高于医疗人员（3.879），两者均接近全院均值（3.918），'
+    u'教学人员（5.000）得分最高但仅1例，仅作描述性参考。')
+add_table_caption(doc, u'表27  动态能力总分分主要工作内容结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'教学', 1, u'5.000±0.000', 1],
         [u'管理', 22, u'3.944±0.774', 2],
         [u'医疗', 42, u'3.879±0.840', 3],
     ])
 
-add_content_section(
-    u'（二）感知识别能力',
-    u'总体差异未达到统计学显著水平（F=0.98，P=0.3823；Kruskal-Wallis P=0.3480）。',
-    u'表27  感知识别能力分主要工作内容结果',
+add_heading(doc, u'（二）感知识别能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=0.98，P=0.3823；Kruskal-Wallis P=0.3480）。'
+    u'管理人员（4.017）与医疗人员（3.938）得分接近，均处于全院均值附近，'
+    u'反映两类人员在政策和服务需求变化识别方面的自评水平较为一致。')
+add_table_caption(doc, u'表28  感知识别能力分主要工作内容结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'教学', 1, u'5.000±0.000', 1],
         [u'管理', 22, u'4.017±0.727', 2],
         [u'医疗', 42, u'3.938±0.785', 3],
     ])
 
-add_content_section(
-    u'（三）学习吸收能力',
-    u'总体差异未达到统计学显著水平（F=0.80，P=0.4529；Kruskal-Wallis P=0.4390）。',
-    u'表28  学习吸收能力分主要工作内容结果',
+add_heading(doc, u'（三）学习吸收能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=0.80，P=0.4529；Kruskal-Wallis P=0.4390）。'
+    u'管理人员（3.936）略高于医疗人员（3.852），两者均接近全院均值。')
+add_table_caption(doc, u'表29  学习吸收能力分主要工作内容结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'教学', 1, u'5.000±0.000', 1],
         [u'管理', 22, u'3.936±0.867', 2],
         [u'医疗', 42, u'3.852±0.934', 3],
     ])
 
-add_content_section(
-    u'（四）协调整合能力',
-    u'总体差异未达到统计学显著水平（F=0.82，P=0.4434；Kruskal-Wallis P=0.4139）。',
-    u'表29  协调整合能力分主要工作内容结果',
+add_heading(doc, u'（四）协调整合能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=0.82，P=0.4434；Kruskal-Wallis P=0.4139）。'
+    u'管理人员（3.955）与医疗人员（3.926）得分接近，两类人员在跨部门协同与流程整合方面的'
+    u'自评水平基本一致。')
+add_table_caption(doc, u'表30  协调整合能力分主要工作内容结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'教学', 1, u'5.000±0.000', 1],
         [u'管理', 22, u'3.955±0.757', 2],
         [u'医疗', 42, u'3.926±0.861', 3],
     ])
 
-add_content_section(
-    u'（五）创新应用能力',
-    u'总体差异未达到统计学显著水平（F=0.90，P=0.4130；Kruskal-Wallis P=0.3377）。',
-    u'表30  创新应用能力分主要工作内容结果',
+add_heading(doc, u'（五）创新应用能力', level=3)
+add_para(doc,
+    u'总体差异未达到统计学显著水平（F=0.90，P=0.4130；Kruskal-Wallis P=0.3377）。'
+    u'管理人员（3.869）略高于医疗人员（3.801），两者均接近全院创新应用能力均值，'
+    u'差异幅度较小。')
+add_table_caption(doc, u'表31  创新应用能力分主要工作内容结果')
+add_table(doc,
+    [u'类别', u'样本量', u'均值±标准差', u'排序'],
     [
         [u'教学', 1, u'5.000±0.000', 1],
         [u'管理', 22, u'3.869±0.862', 2],
@@ -831,16 +957,16 @@ add_para(doc,
     u'其他结果在控制背景变量后均未达到统计学显著水平。'
     u'后续推动创新应用能力建设，可重点关注管理者能力、医务人员业务水平以及管理与临床协同。')
 
-def add_factor_section(title_text, head_text, table_caption, rows):
-    add_heading(doc, title_text, level=3)
-    add_para(doc, head_text)
-    add_table_caption(doc, table_caption)
-    add_table(doc, [u'影响因素', u'回归系数±标准误', u'P值'], rows)
-
-add_factor_section(
-    u'（一）动态能力总分',
-    u'七类影响因素对动态能力总分的影响均未达到统计学显著水平。',
-    u'表31  动态能力总分影响因素综合调整模型结果',
+add_heading(doc, u'（一）动态能力总分', level=3)
+add_para(doc,
+    u'综合调整模型显示，七类影响因素对动态能力总分的影响均未达到统计学显著水平。'
+    u'从系数方向看，医院文化（1.288）和员工因素（0.463）呈正向趋势，且接近显著（P分别为0.099、0.091），'
+    u'医院资源（0.179）系数为正但幅度较小；医院战略（-0.553）、路径依赖（-0.071）、'
+    u'环境因素（-0.028）和管理特征（-0.325）系数为负，但均未达到统计学显著水平。'
+    u'结果提示，在本次样本中，医院文化和员工因素对动态能力总分呈现一定积极作用倾向。')
+add_table_caption(doc, u'表32  动态能力总分影响因素综合调整模型结果')
+add_table(doc,
+    [u'影响因素', u'回归系数±标准误', u'P值'],
     [
         [u'医院文化', u'1.288±0.745', 0.099],
         [u'医院资源', u'0.179±0.340', 0.604],
@@ -851,10 +977,15 @@ add_factor_section(
         [u'管理特征', u'-0.325±0.655', 0.625],
     ])
 
-add_factor_section(
-    u'（二）感知识别能力',
-    u'七类影响因素的影响均未达到统计学显著水平。',
-    u'表32  感知识别能力影响因素综合调整模型结果',
+add_heading(doc, u'（二）感知识别能力', level=3)
+add_para(doc,
+    u'综合调整模型显示，七类影响因素对感知识别能力的影响均未达到统计学显著水平。'
+    u'从系数方向看，医院文化（1.557）和员工因素（0.540）系数为正，医院资源（0.071）也为正，'
+    u'但置信区间较宽，统计上不显著；医院战略、路径依赖、环境因素和管理特征系数为负。'
+    u'总体上，感知识别能力的组织层面影响因素在控制背景变量后作用有限，可能与样本量相对较小有关。')
+add_table_caption(doc, u'表33  感知识别能力影响因素综合调整模型结果')
+add_table(doc,
+    [u'影响因素', u'回归系数±标准误', u'P值'],
     [
         [u'医院文化', u'1.557±1.077', 0.163],
         [u'医院资源', u'0.071±0.480', 0.884],
@@ -865,10 +996,15 @@ add_factor_section(
         [u'管理特征', u'-0.888±0.998', 0.384],
     ])
 
-add_factor_section(
-    u'（三）学习吸收能力',
-    u'综合调整模型显示，七类影响因素对学习吸收能力的影响均未达到统计学显著水平。',
-    u'表33  学习吸收能力影响因素综合调整模型结果',
+add_heading(doc, u'（三）学习吸收能力', level=3)
+add_para(doc,
+    u'综合调整模型显示，七类影响因素对学习吸收能力的影响均未达到统计学显著水平，'
+    u'但医院文化（1.768，P=0.091）和员工因素（0.589，P=0.065）系数为正且接近显著，'
+    u'呈现一定正向影响趋势。提示持续加强医院文化建设和员工因素支撑，'
+    u'有助于促进外部知识与信息的内部转化和吸收。')
+add_table_caption(doc, u'表34  学习吸收能力影响因素综合调整模型结果')
+add_table(doc,
+    [u'影响因素', u'回归系数±标准误', u'P值'],
     [
         [u'医院文化', u'1.768±0.996', 0.091],
         [u'医院资源', u'0.111±0.347', 0.752],
@@ -879,10 +1015,16 @@ add_factor_section(
         [u'管理特征', u'-0.265±0.716', 0.715],
     ])
 
-add_factor_section(
-    u'（四）协调整合能力',
-    u'七类影响因素的影响均未达到统计学显著水平。',
-    u'表34  协调整合能力影响因素综合调整模型结果',
+add_heading(doc, u'（四）协调整合能力', level=3)
+add_para(doc,
+    u'综合调整模型显示，七类影响因素对协调整合能力的影响均未达到统计学显著水平。'
+    u'从系数方向看，医院文化（0.637）、医院资源（0.130）和管理特征（0.157）呈弱正向趋势，'
+    u'医院战略和员工因素系数接近于零，路径依赖（-0.082）呈弱负向趋势。'
+    u'结果反映在本次样本中，协调整合能力更多受到综合背景变量和组织日常运行状态的影响，'
+    u'单一组织条件作用相对有限。')
+add_table_caption(doc, u'表35  协调整合能力影响因素综合调整模型结果')
+add_table(doc,
+    [u'影响因素', u'回归系数±标准误', u'P值'],
     [
         [u'医院文化', u'0.637±0.643', 0.333],
         [u'医院资源', u'0.130±0.298', 0.666],
@@ -893,12 +1035,14 @@ add_factor_section(
         [u'管理特征', u'0.157±0.606', 0.798],
     ])
 
-add_factor_section(
-    u'（五）创新应用能力',
+add_heading(doc, u'（五）创新应用能力', level=3)
+add_para(doc,
     u'综合调整模型显示，员工因素与创新应用能力呈显著正向关联（回归系数=0.683，P=0.021）。'
     u'结果提示，管理者能力、医务人员业务水平以及管理与临床协同，对医院推进技术应用、'
-    u'服务改进和管理创新具有重要支撑作用。其余影响因素对创新应用能力的影响均未达到统计学显著水平。',
-    u'表35  创新应用能力影响因素综合调整模型结果',
+    u'服务改进和管理创新具有重要支撑作用。其余影响因素对创新应用能力的影响均未达到统计学显著水平。')
+add_table_caption(doc, u'表36  创新应用能力影响因素综合调整模型结果')
+add_table(doc,
+    [u'影响因素', u'回归系数±标准误', u'P值'],
     [
         [u'医院文化', u'1.192±0.765', 0.134],
         [u'医院资源', u'0.404±0.403', 0.327],
@@ -926,18 +1070,14 @@ add_para(doc,
     u'和服务公平可及性的评价也越高。分维度看，协调整合能力、创新应用能力和学习吸收能力'
     u'在多项绩效指标中的回归系数相对较高。')
 
-def add_perf_section(title_text, head_text, table_caption, rows):
-    add_heading(doc, title_text, level=3)
-    add_para(doc, head_text)
-    add_table_caption(doc, table_caption)
-    add_table(doc, [u'动态能力指标', u'回归系数±标准误', u'P值'], rows)
-
-add_perf_section(
-    u'（一）服务量',
+add_heading(doc, u'（一）服务量', level=3)
+add_para(doc,
     u'服务量方面，动态能力总分及四个维度均呈显著正向关联。'
     u'其中协调整合能力（0.507）、动态能力总分（0.495）和创新应用能力（0.477）的回归系数相对较高，'
-    u'提示服务量提升与资源统筹、流程衔接和创新应用能力关系较为密切。',
-    u'表36  服务量影响结果',
+    u'提示服务量提升与资源统筹、流程衔接和创新应用能力关系较为密切。')
+add_table_caption(doc, u'表37  服务量影响结果')
+add_table(doc,
+    [u'动态能力指标', u'回归系数±标准误', u'P值'],
     [
         [u'动态能力总分', u'0.495±0.119', u'<0.001'],
         [u'感知识别能力', u'0.356±0.140', 0.017],
@@ -946,12 +1086,14 @@ add_perf_section(
         [u'创新应用能力', u'0.477±0.097', u'<0.001'],
     ])
 
-add_perf_section(
-    u'（二）医疗质量',
+add_heading(doc, u'（二）医疗质量', level=3)
+add_para(doc,
     u'医疗质量方面，动态能力总分及四个维度均呈显著正向关联。'
     u'其中协调整合能力（0.489）、动态能力总分（0.476）和创新应用能力（0.461）的回归系数相对较高，'
-    u'提示医疗质量提升与资源整合、知识转化和创新实践能力密切相关。',
-    u'表37  医疗质量影响结果',
+    u'提示医疗质量提升与资源整合、知识转化和创新实践能力密切相关。')
+add_table_caption(doc, u'表38  医疗质量影响结果')
+add_table(doc,
+    [u'动态能力指标', u'回归系数±标准误', u'P值'],
     [
         [u'动态能力总分', u'0.476±0.132', 0.001],
         [u'感知识别能力', u'0.326±0.143', 0.031],
@@ -960,12 +1102,14 @@ add_perf_section(
         [u'创新应用能力', u'0.461±0.116', u'<0.001'],
     ])
 
-add_perf_section(
-    u'（三）运营效率',
+add_heading(doc, u'（三）运营效率', level=3)
+add_para(doc,
     u'运营效率方面，动态能力总分及四个维度均呈显著正向关联。'
     u'其中协调整合能力（0.448）和动态能力总分（0.435）的回归系数相对较高，'
-    u'提示提高运营效率需要持续加强资源配置、流程衔接和跨部门协同。',
-    u'表38  运营效率影响结果',
+    u'提示提高运营效率需要持续加强资源配置、流程衔接和跨部门协同。')
+add_table_caption(doc, u'表39  运营效率影响结果')
+add_table(doc,
+    [u'动态能力指标', u'回归系数±标准误', u'P值'],
     [
         [u'动态能力总分', u'0.435±0.118', 0.001],
         [u'感知识别能力', u'0.306±0.133', 0.029],
@@ -974,12 +1118,14 @@ add_perf_section(
         [u'创新应用能力', u'0.419±0.103', u'<0.001'],
     ])
 
-add_perf_section(
-    u'（四）患者满意度',
+add_heading(doc, u'（四）患者满意度', level=3)
+add_para(doc,
     u'患者满意度方面，动态能力总分及四个维度均呈显著正向关联。'
     u'其中协调整合能力（0.637）、动态能力总分（0.577）和创新应用能力（0.548）的回归系数相对较高，'
-    u'提示患者体验改善与流程协同、服务创新和资源响应能力关系较为紧密。',
-    u'表39  患者满意度影响结果',
+    u'提示患者体验改善与流程协同、服务创新和资源响应能力关系较为紧密。')
+add_table_caption(doc, u'表40  患者满意度影响结果')
+add_table(doc,
+    [u'动态能力指标', u'回归系数±标准误', u'P值'],
     [
         [u'动态能力总分', u'0.577±0.132', u'<0.001'],
         [u'感知识别能力', u'0.385±0.151', 0.017],
@@ -988,12 +1134,14 @@ add_perf_section(
         [u'创新应用能力', u'0.548±0.114', u'<0.001'],
     ])
 
-add_perf_section(
-    u'（五）员工满意度',
+add_heading(doc, u'（五）员工满意度', level=3)
+add_para(doc,
     u'员工满意度方面，动态能力总分及四个维度均呈显著正向关联。'
     u'其中协调整合能力（0.570）、动态能力总分（0.525）和学习吸收能力（0.483）的回归系数相对较高，'
-    u'提示组织运行顺畅、内部学习支持和资源协同对员工评价具有积极意义。',
-    u'表40  员工满意度影响结果',
+    u'提示组织运行顺畅、内部学习支持和资源协同对员工评价具有积极意义。')
+add_table_caption(doc, u'表41  员工满意度影响结果')
+add_table(doc,
+    [u'动态能力指标', u'回归系数±标准误', u'P值'],
     [
         [u'动态能力总分', u'0.525±0.132', u'<0.001'],
         [u'感知识别能力', u'0.367±0.149', 0.021],
@@ -1002,12 +1150,14 @@ add_perf_section(
         [u'创新应用能力', u'0.482±0.105', u'<0.001'],
     ])
 
-add_perf_section(
-    u'（六）服务公平可及性',
+add_heading(doc, u'（六）服务公平可及性', level=3)
+add_para(doc,
     u'服务公平可及性方面，动态能力总分及四个维度均呈显著正向关联。'
     u'其中协调整合能力（0.503）、动态能力总分（0.456）和创新应用能力（0.440）的回归系数相对较高，'
-    u'提示优化资源配置、提升协同效率和推进服务创新，有助于改善服务公平可及性评价。',
-    u'表41  服务公平可及性影响结果',
+    u'提示优化资源配置、提升协同效率和推进服务创新，有助于改善服务公平可及性评价。')
+add_table_caption(doc, u'表42  服务公平可及性影响结果')
+add_table(doc,
+    [u'动态能力指标', u'回归系数±标准误', u'P值'],
     [
         [u'动态能力总分', u'0.456±0.108', u'<0.001'],
         [u'感知识别能力', u'0.299±0.125', 0.024],
@@ -1021,35 +1171,75 @@ add_perf_section(
 add_heading(doc, u'十、发展建议', level=2)
 
 add_para(doc,
-    u'结合前述分析，后续动态能力建设可重点围绕以下三个方面开展工作。')
+    u'结合前述分组比较、影响因素分析和动态能力—医院绩效的关联结果，'
+    u'后续动态能力建设可围绕"补短板、强协同、育人才、重人群"四条思路展开，'
+    u'具体从以下四个方面深入推进。')
 
 add_heading(doc, u'（一）突出创新应用和感知识别两个相对薄弱的维度', level=3)
 add_para(doc,
-    u'创新应用能力是本院四个维度中得分相对最低的维度，感知识别能力与其他12家医院均值的差距'
-    u'在四个维度中相对较大。后续可在两个方面持续加强：'
-    u'一是建立政策变化、患者需求变化、同行发展动向和新技术新方法等信息的常态化跟踪与研讨机制，'
-    u'加强感知识别能力建设；二是在服务流程优化、医疗技术应用、管理改进项目和跨机构合作等方面'
-    u'形成创新任务清单，推动创新应用能力提升。')
+    u'创新应用能力是本院四个维度中得分相对最低的维度（3.842），'
+    u'感知识别能力与其他12家上海市公立医院平均水平的差距在四个维度中相对较大（-0.510），'
+    u'应成为下一阶段能力建设的重点方向。'
+    u'一是强化感知识别能力建设，围绕国家医改政策、上海市公立医院管理要求、同类医院先进做法、'
+    u'患者就医需求变化以及新技术新设备新方法等，建立常态化的外部信息跟踪与研讨机制，'
+    u'通过定期发布政策简报、组织行业动态专题学习、召开院级圆桌讨论等方式，'
+    u'使临床科室和职能部门都能及时获取并研判外部变化信号。'
+    u'二是推动创新应用能力提升，围绕临床服务流程优化、诊疗路径改进、新技术与新设备应用、'
+    u'信息化与智慧医院建设、跨机构合作等方向，形成年度创新任务清单，'
+    u'配套设立创新项目立项、专项支持、人员激励和成效评估等机制。'
+    u'三是关注"感知—应用"的衔接，将外部信息捕捉结果有序转化为院内改进与创新项目，'
+    u'避免感知与应用两端脱节，提高动态能力的整体转化效率。')
 
 add_heading(doc, u'（二）加强协调整合能力，支撑医院整体绩效提升', level=3)
 add_para(doc,
-    u'动态能力与医院绩效的分析结果显示，协调整合能力在服务量、医疗质量、运营效率、患者满意度、'
-    u'员工满意度和服务公平可及性六项绩效指标中的回归系数多处于相对较高水平。'
-    u'后续可通过跨部门协作、资源统筹和流程再造，进一步加强协调整合能力，'
-    u'支撑医院整体绩效表现。')
+    u'动态能力与医院绩效的分析结果显示，协调整合能力在服务量（0.507）、医疗质量（0.489）、'
+    u'运营效率（0.448）、患者满意度（0.637）、员工满意度（0.570）和服务公平可及性（0.503）'
+    u'六项绩效指标中的回归系数均处于相对较高水平，是动态能力建设的关键抓手。'
+    u'一是从组织结构入手，加强职能部门之间、临床科室与行政部门之间、医疗与护理之间、'
+    u'医疗与医技之间的协作机制，建立常态化的联席会议和跨部门专项工作组，'
+    u'推动重大事项与共性问题的联合研究、统一部署。'
+    u'二是从流程视角持续推进关键就医环节和管理环节的流程再造，'
+    u'重点梳理影响服务量、医疗质量和患者体验的关键流程节点，'
+    u'以患者旅程和员工体验为主线推动流程优化。'
+    u'三是从资源配置角度，建立基于需求和绩效的资源动态调整机制，'
+    u'推动人员、床位、设备、信息等资源在院内的统筹调配，'
+    u'并通过数据化运营监测工具，提升协调整合的可视化和可操作性。')
 
 add_heading(doc, u'（三）以员工因素为支点推进动态能力建设', level=3)
 add_para(doc,
-    u'影响因素分析结果显示，员工因素（管理者能力、医务人员业务水平以及管理与临床协同）'
-    u'对创新应用能力呈显著正向作用。后续可围绕管理者能力建设、医务人员业务水平提升和'
-    u'管理与临床协同机制三个方面开展工作，同时将医院文化、资源配置、战略推进和流程协作等'
-    u'作为配套工作持续完善。')
+    u'影响因素分析结果显示，员工因素（管理者能力、医务人员业务水平、管理与临床协同）'
+    u'是唯一对创新应用能力呈显著正向影响的因素（β=0.683，P=0.021），'
+    u'同时在动态能力总分和学习吸收能力方面也呈现接近显著的正向趋势。'
+    u'后续应将员工能力建设作为动态能力提升的核心支点，重点推进三方面工作。'
+    u'一是加强管理者能力建设，面向科室负责人和职能部门负责人，'
+    u'开展现代医院管理、绩效管理、项目推进、冲突协调等专题培训与跨院交流，'
+    u'同步完善中层干部的选拔、轮岗与考核机制，'
+    u'让具备动态能力特质的管理者承担更多推动改革和创新的角色。'
+    u'二是提升医务人员专业水平，依托本院现有培训体系，'
+    u'加强新技术新方法、循证实践、科研能力和跨学科协作等方面的学习机会，'
+    u'鼓励一线人员以项目参与、课题研究、院外短期进修等形式持续积累能力。'
+    u'三是完善管理与临床协同机制，搭建职能部门与临床科室之间的常态化沟通渠道，'
+    u'围绕医院重点工作、政策落地、问题整改开展共同研讨；'
+    u'同时，将医院文化、资源配置、战略推进和流程协作等作为配套工作持续完善，'
+    u'为员工因素的持续发挥提供系统性支撑。')
 
 add_heading(doc, u'（四）关注分组比较中得分相对较低的科室和人群', level=3)
 add_para(doc,
-    u'在尊重样本量限制的前提下，分组比较结果显示，急诊相关科室、儿科和外科系在多项指标上'
-    u'得分相对较低，副高级及正高级职称人员、科室负责人和工作年限20年以上人员得分相对较低。'
-    u'后续能力建设可结合上述群体的岗位特点和实际工作情况，开展有针对性的支持与改进工作。')
+    u'在尊重样本量限制的前提下，分组比较结果显示了需要给予更多关注的群体：'
+    u'科室层面主要包括急诊相关科室、儿科、外科系等临床一线压力较大的科室；'
+    u'人员层面主要包括副高级及正高级职称人员、科室负责人以及本院工作年限20年以上的资深人员。'
+    u'一是针对急诊、外科等高压力科室，结合其工作节奏和资源配置特点，'
+    u'适当增加信息获取、学习交流和参与决策的渠道，'
+    u'例如在院级例会、改进项目、培训安排等环节预留相应名额，'
+    u'减少"被动执行"的比重，让一线科室更多参与到变革方案的设计中。'
+    u'二是针对中高级职称与资深人员，结合其丰富经验和对医院运行的熟悉度，'
+    u'通过核心骨干座谈、专题调研、参与院级专项和专家咨询等方式，'
+    u'充分释放其经验积累的价值，同时通过轮岗、带教和项目领衔等机制，'
+    u'鼓励其持续参与创新与变革实践。'
+    u'三是针对科室负责人，强化其在感知识别、资源协调和创新推进中的"带头人"角色，'
+    u'通过管理能力培训、绩效考核和横向交流等方式，'
+    u'形成一支具有较强动态能力的中层骨干队伍，'
+    u'支撑全院动态能力水平的系统性提升。')
 
 
 # =================== 保存 ===================
